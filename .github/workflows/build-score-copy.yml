@@ -1,309 +1,155 @@
 # Build the score-copy test version from the public ios-v0.3.9 code.
-
 name: Build score-copy IPA
-
 on:
-
   workflow_dispatch:
-
   push:
-
     paths: ['.github/workflows/build-score-copy.yml']
-
 permissions:
-
   contents: read
-
 jobs:
-
   build:
-
     runs-on: macos-15
-
     timeout-minutes: 35
-
     steps:
-
       - name: Check out the original public release
-
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
         with:
-
           repository: gmiya233/RMb30
-
           ref: f4731dae4a4f3aa4fd6eeef4640a4766fc261b6d
-
           persist-credentials: false
-
       - name: Apply the local score-copy import change
-
         shell: bash
-
         run: |
-
           git apply - <<'SCORE_COPY_PATCH'
-
           --- a/ios/App/AppModel.swift
-
           +++ b/ios/App/AppModel.swift
-
           @@ -141,12 +141,18 @@
-
                        catch { status = "谱库暂未更新，继续按本地目录筛选" }
-
                    }
-
                }
-
           -    func importScores() {
-
           +    func importScores(fromCopy: Bool = false) {
-
                    guard !busy, ready else { return }; busy = true
-
                    task = Task {
-
                        defer { busy = false; task = nil }
-
                        do {
-
           -                let root = try DirectoryBookmark.resolve(); await refreshIfNeeded(checkRevision: true)
-
           +                let root: URL
-
           +                if fromCopy {
-
           +                    root = try await Task.detached(priority: .userInitiated) { try LocalPaths.scoreCopyForImport() }.value
-
           +                } else {
-
           +                    root = try DirectoryBookmark.resolve()
-
           +                }
-
           +                await refreshIfNeeded(checkRevision: true)
-
                            let previous = state, profile = qq, currentCatalogue = catalogue
-
                            let output = try await importer.scan(root: root, catalogue: currentCatalogue, previous: previous) { [weak self] text in
-
                                await self?.setProgress(text)
-
           @@ -158,7 +164,10 @@
-
                                do { try await mergeCloud(upload: true) } catch { status = output.report.summary + "；云端同步未完成，本机成绩已保存"; self.error = error.localizedDescription }
-
                            }
-
                        } catch is CancellationError { status = "读取已取消，原成绩保留" }
-
           -            catch { self.error = error.localizedDescription; status = "读取未完成，原成绩保留；可重新选择文件夹后再试" }
-
           +            catch {
-
           +                self.error = error.localizedDescription
-
           +                status = fromCopy ? "副本读取未完成，请检查成绩导入文件夹。" : "读取未完成，原成绩保留；可重新选择文件夹后再试"
-
           +            }
-
                    }
-
                }
-
                private func setProgress(_ text: String) { status = text }
-
           --- a/ios/App/DirectoryAccess.swift
-
           +++ b/ios/App/DirectoryAccess.swift
-
           @@ -37,6 +37,26 @@
-
            }
-
            
-
            enum LocalPaths {
-
           +    // The user places copies here in Files. No external URL or bookmark is needed.
-
           +    static func scoreCopyForImport() throws -> URL {
-
           +        let fm = FileManager.default
-
           +        let documents = try fm.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-
           +        let root = documents.appendingPathComponent("成绩导入", isDirectory: true)
-
           +        try fm.createDirectory(at: root, withIntermediateDirectories: true)
-
           +        let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
-
           +        let rootInfo = try root.resourceValues(forKeys: keys)
-
           +        guard rootInfo.isDirectory == true, rootInfo.isSymbolicLink != true else {
-
           +            throw MalodyError.invalid("成绩导入必须是普通文件夹。")
-
           +        }
-
           +        for name in ["chart", "replay"] {
-
           +            let child = root.appendingPathComponent(name, isDirectory: true)
-
           +            guard let info = try? child.resourceValues(forKeys: keys),
-
           +                  info.isDirectory == true, info.isSymbolicLink != true else {
-
           +                throw MalodyError.invalid("请在「文件 → 我的 iPad（或我的 iPhone）→ Malody Link → 成绩导入」中放入 chart 和 replay 两个文件夹的副本，等拷贝完成后再点「读取成绩副本」。")
-
           +            }
-
           +        }
-
           +        return root
-
           +    }
-
                static var base: URL {
-
                    let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("MalodyLink", isDirectory: true)
-
                    try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-
           --- a/ios/App/SettingsPages.swift
-
           +++ b/ios/App/SettingsPages.swift
-
           @@ -23,9 +23,11 @@
-
                            Card {
-
                                Label("首次使用 · 授权成绩文件夹", systemImage: "folder.badge.plus").font(.title3.bold()).foregroundStyle(Palette.accent)
-
                                Text("1. 点击下面按钮，进入 Malody V 根目录。\n2. 看到 chart 和 replay 后，点右上角「打开」，不必逐个点文件。\n3. 等待显示「文件夹已授权」，再回首页点「本机同步」。").font(.subheadline)
-
           -                    Text("如系统未开放 Malody 的目录，可先在电脑上复制 chart 和 replay 到 iCloud Drive 的同一文件夹，再在这里授权。").font(.caption).foregroundStyle(.secondary)
-
                                Text(model.folderName.isEmpty ? "尚未授权" : "已授权：" + model.folderName).font(.caption)
-
                                Button("选择 Malody V 文件夹") { model.presentFolderPicker() }.buttonStyle(.borderedProminent).frame(minHeight: 44)
-
           +                    Divider()
-
           +                    Text("点「打开」没反应？先点一次「读取成绩副本」生成目录，再把游戏里的 chart 和 replay 拷贝到「文件 → 我的 iPad（或我的 iPhone）→ Malody Link → 成绩导入」。拷贝完成后再点一次。副本不会自动更新。").font(.caption).foregroundStyle(.secondary)
-
           +                    Button("读取成绩副本") { model.importScores(fromCopy: true) }.buttonStyle(.bordered).frame(minHeight: 44)
-
                            }
-
                            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: typeSize.isAccessibilitySize ? 1 : 2), alignment: .leading, spacing: 12) {
-
                                action("批量导谱 / QQ 曲包", icon: "square.stack.3d.up") { model.showingPackages = true }
-
           --- a/ios/project.yml
-
           +++ b/ios/project.yml
-
           @@ -27,7 +27,7 @@
-
                  properties:
-
                    CFBundleDisplayName: Malody Link
-
                    CFBundleShortVersionString: '0.3.9'
-
           -        CFBundleVersion: '13'
-
           +        CFBundleVersion: '14'
-
                    LSRequiresIPhoneOS: true
-
                    UILaunchScreen: {}
-
                    UIRequiresFullScreen: false
-
           @@ -36,7 +36,7 @@
-
                    NSAppTransportSecurity:
-
                      NSAllowsArbitraryLoads: true
-
                    NSPhotoLibraryAddUsageDescription: 将你生成的 B30 成绩图保存到照片。
-
           -        UIFileSharingEnabled: false
-
           +        UIFileSharingEnabled: true
-
                    LSSupportsOpeningDocumentsInPlace: true
-
                    CFBundleDocumentTypes:
-
                      - CFBundleTypeName: Malody chart package
-
           SCORE_COPY_PATCH
-
       - name: Test core
-
         run: swift test --package-path ios
-
       - name: Prepare the same resources as the upstream iOS release
-
         shell: bash
-
         env:
-
           GH_TOKEN: ${{ github.token }}
-
         run: |
-
           mkdir -p build/ios-resources
-
           gh release download v1.6.11 --repo gmiya233/RMb30 --pattern '*.APK' --dir build/ios-resources
-
           python3 tools/prepare_ios_resources.py --apk build/ios-resources/*.APK
-
           swift tools/normalize_ios_images.swift ios/Resources
-
           swift tools/create_ios_icon.swift ios/App/Assets.xcassets/AppIcon.appiconset
-
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
-
           cd ios && xcodegen generate
-
       - name: Build and verify unsigned iPad and iPhone IPA
-
         shell: bash
-
         run: |
-
           set -o pipefail
-
           xcodebuild -project ios/MalodyLink.xcodeproj -scheme MalodyLink -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/ios-device CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' build | tee build/ios-build.log
-
           python3 tools/package_ios.py build/ios-device/Build/Products/Release-iphoneos/MalodyLink.app
-
           app=build/ios-device/Build/Products/Release-iphoneos/MalodyLink.app
-
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist")" = 14
-
           test "$(/usr/libexec/PlistBuddy -c 'Print :UIFileSharingEnabled' "$app/Info.plist")" = true
-
           mkdir -p deliver
-
           cp dist/Malody-Link-iOS-0.3.9-unsigned.ipa deliver/Malody-Link-0.3.9-score-copy-unsigned.ipa
-
       - name: Save unsigned IPA
-
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-
         with:
-
           name: score-copy-IPA
-
           path: deliver/*.ipa
-
           if-no-files-found: error
-
           retention-days: 7
